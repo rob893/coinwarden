@@ -1,0 +1,12 @@
+{
+  "name": "coinwarden-template",
+  "private": true,
+  "scripts": {
+    "start": "cd Coinwarden.API && dotnet watch run --launch-profile https",
+    "build-api": "cd Coinwarden.API && dotnet build",
+    "test-api": "dotnet test",
+    "publish-api": "cd Coinwarden.API && dotnet publish -c Release -o dist",
+    "start-ui": "cd coinwarden-ui && npm run dev",
+    "build-ui": "cd coinwarden-ui && npm run build"
+  }
+}

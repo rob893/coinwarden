@@ -1,0 +1,51 @@
+name: Build & Test UI
+description: >-
+  Shared Node.js setup, install, lint, test, and build for the coinwarden-ui.
+  Artifact upload stays in the calling deploy workflow.
+
+inputs:
+  node-version:
+    description: Node.js version to install.
+    required: false
+    default: '24'
+  vite-api-base-url:
+    description: Base URL of the deployed API, injected into the production build.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+        cache: 'npm'
+        cache-dependency-path: coinwarden-ui/package-lock.json
+
+    - name: Install packages
+      run: npm ci
+      shell: bash
+      working-directory: coinwarden-ui
+
+    - name: Audit dependencies
+      run: npm audit --audit-level=high
+      shell: bash
+      working-directory: coinwarden-ui
+
+    - name: Lint
+      run: npm run lint
+      shell: bash
+      working-directory: coinwarden-ui
+
+    - name: Test
+      run: npm run test
+      shell: bash
+      working-directory: coinwarden-ui
+
+    - name: Build
+      run: npm run build
+      shell: bash
+      working-directory: coinwarden-ui
+      env:
+        VITE_API_BASE_URL: ${{ inputs.vite-api-base-url }}

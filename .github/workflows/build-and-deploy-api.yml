@@ -1,0 +1,100 @@
+# Build and Deploy API — Coinwarden.API → Azure App Service
+#
+# Auth model: OIDC (no long-lived secrets). Configure a federated credential on
+# your Azure AD app registration with subject:
+#   repo:<owner>/<repo>:ref:refs/heads/main
+#
+# Required secrets (Settings → Secrets and variables → Actions → Secrets):
+#   AZURE_CLIENT_ID          - App registration / managed identity client ID
+#   AZURE_TENANT_ID          - Azure AD tenant ID
+#   AZURE_SUBSCRIPTION_ID    - Azure subscription ID
+#   POSTGRES_ADMIN_PASSWORD  - PostgreSQL admin password (used only during Bicep infra deploy)
+#
+# Required vars (Settings → Secrets and variables → Actions → Variables):
+#   AZURE_RESOURCE_GROUP     - Resource group name (e.g. coinwarden-rg-dev)
+#   AZURE_WEBAPP_NAME        - App Service web app name (e.g. coinwarden-api-dev)
+
+name: Build and Deploy API
+
+on:
+  # NOTE: the push trigger is intentionally commented out so this *template* repo does not try to deploy.
+  # Uncomment it after configuring the required secrets/variables (see README -> "Using this template").
+  # push:
+  #   branches:
+  #     - main
+  #     - master
+  #   paths:
+  #     - 'Coinwarden.API/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build API
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup & restore .NET
+        uses: ./.github/actions/build-test-api
+        with:
+          run-build-test: 'false'
+
+      - name: Publish
+        run: dotnet publish Coinwarden.API -c Release -o publish
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coinwarden-api-b${{ github.run_number }}
+          path: publish
+          retention-days: 30
+
+  deploy:
+    name: Deploy to Azure App Service
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      id-token: write # required for OIDC token request
+      contents: read
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: coinwarden-api-b${{ github.run_number }}
+          path: publish
+
+      - name: Log in to Azure (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # Optional infrastructure step: provisions/updates all Azure resources via Bicep.
+      # Runs on manual dispatch so you can apply infra changes on demand without a full
+      # code push. Incremental mode means existing resources are updated, not recreated.
+      - name: Deploy Bicep infrastructure
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          POSTGRES_ADMIN_PASSWORD: ${{ secrets.POSTGRES_ADMIN_PASSWORD }}
+        run: |
+          az deployment group create \
+            --resource-group ${{ vars.AZURE_RESOURCE_GROUP }} \
+            --template-file CI/Azure/main.bicep \
+            --parameters @CI/Azure/parameters/main.parameters.dev.json \
+            --parameters postgresAdminPassword="$POSTGRES_ADMIN_PASSWORD" \
+            --mode Incremental
+
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ vars.AZURE_WEBAPP_NAME }}
+          package: publish

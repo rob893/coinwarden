@@ -1,0 +1,69 @@
+# Build and Deploy UI — coinwarden-ui → GitHub Pages
+#
+# Prerequisites:
+#   1. Enable GitHub Pages: Settings → Pages → Source → GitHub Actions
+#   2. If deploying to a project site (not a user/org site), set the Vite base path
+#      in coinwarden-ui/vite.config.ts:
+#        base: '/<repo-name>/'        (e.g. '/coinwarden-template/')
+#      For a custom domain or user/org site (username.github.io), use:
+#        base: '/'
+#      The UI already uses HashRouter, so client-side routing works on Pages.
+#
+# Required vars (Settings → Secrets and variables → Actions → Variables):
+#   VITE_API_BASE_URL  - Base URL of the deployed API
+#                        e.g. https://coinwarden-api-dev.azurewebsites.net
+
+name: Build and Deploy UI
+
+on:
+  # NOTE: the push trigger is intentionally commented out so this *template* repo does not try to deploy.
+  # Uncomment it after configuring the required secrets/variables (see README -> "Using this template").
+  # push:
+  #   branches:
+  #     - main
+  #     - master
+  #   paths:
+  #     - 'coinwarden-ui/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false  # let an in-progress deploy finish before starting another
+
+jobs:
+  build:
+    name: Build UI
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Build & test UI
+        uses: ./.github/actions/build-test-ui
+        with:
+          vite-api-base-url: ${{ vars.VITE_API_BASE_URL }}
+
+      # Path is relative to workspace root; working-directory default does not apply to `uses` steps
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: coinwarden-ui/dist
+
+  deploy:
+    name: Deploy to GitHub Pages
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

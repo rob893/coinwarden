@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="Coinwarden.API.Tests/Coinwarden.API.Tests.csproj" />
+  <Project Path="Coinwarden.API/Coinwarden.API.csproj" />
+</Solution>

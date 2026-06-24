@@ -1,0 +1,10 @@
+namespace Coinwarden.API.Models.Settings;
+
+public sealed record OpenApiAuthSettings
+{
+    public string Username { get; init; } = default!;
+
+    public string Password { get; init; } = default!;
+
+    public bool RequireAuth { get; init; }
+}
