@@ -3,7 +3,7 @@
 **Status:** Draft
 **Owner:** @rob893
 **Scope:** Core data syncing jobs + time-series storage/retention/rollup + read APIs (incl. aggregates)
-**Applies to:** Coinwarden API (rebuild of WoW Market Watcher on `starter-app-template`)
+**Applies to:** API (rebuild of WoW Market Watcher on `starter-app-template`)
 
 ---
 
@@ -25,8 +25,8 @@ This spec covers **only** the foundational data pipeline:
 
 - Capture **hourly snapshots** of **all commodity items** (region-wide) and **all items on a
   configurable set of connected realms**.
-- Preserve **item-variant granularity** (item bonuses / modifiers / pet attributes), not just base item
-  IDs.
+- Preserve the **buyer-facing item-variant granularity** (`bonus_lists` — ilvl/quality/sockets — and
+  pet identity), not just base item IDs.
 - Keep **full-resolution data for 30 days**, then retain **daily candlesticks indefinitely**.
 - Operate within a small/cheap Azure Postgres footprint with a predictable storage growth story.
 - Preserve the old app's **item-syncing** behavior (auction-driven item discovery → metadata backfill).
@@ -40,17 +40,16 @@ into.
 
 ### 1.3 Confirmed product/architecture decisions
 
-| Area | Decision |
-|---|---|
-| Region | **US only** to start (`dynamic-us`), region-aware design for later expansion |
-| Commodities | **Region-wide, all items**, hourly |
-| Per-realm scope | Configurable **allow-list** of connected realms **∪** watch-list/alert-driven realms+items |
-| Granularity | **Preserve item bonuses/modifiers** — snapshots keyed by item *variant* |
-| Storage engine | **Native Postgres declarative partitioning** + scheduled rollups (no TimescaleDB) |
-| Storage tiers | **Hot Postgres** (allow-list + commodities) + **cold Azure Blob** archive (raw JSON landing zone + Parquet for *all* realms) |
-| Raw retention | **30 days** of hourly snapshots (dropped by partition) |
-| Aggregated retention | **Daily candlesticks kept indefinitely** |
-| Background jobs | **Hangfire** (added to the template; per `vision.md`) |
+| Area                 | Decision                                                                                                 |
+| -------------------- | -------------------------------------------------------------------------------------------------------- |
+| Region               | **US only** to start (`dynamic-us`), region-aware design for later expansion                             |
+| Commodities          | **Region-wide, all items**, hourly                                                                       |
+| Per-realm scope      | Configurable **allow-list** of connected realms **∪** watch-list/alert-driven realms+items               |
+| Granularity          | **Key on `bonus_lists` + pet identity** (not raw `modifiers`) — snapshots by item _variant_, ~1.73× rows |
+| Storage engine       | **Native Postgres declarative partitioning** + scheduled rollups (no TimescaleDB)                        |
+| Raw retention        | **30 days** of hourly snapshots (dropped by partition)                                                   |
+| Aggregated retention | **Daily candlesticks kept indefinitely**                                                                 |
+| Background jobs      | **Hangfire** (added to the template; per `vision.md`)                                                    |
 
 ---
 
@@ -88,19 +87,33 @@ into.
 - **Decision:** use **native Postgres declarative range partitioning** + Hangfire rollup/maintenance
   jobs. Zero extension/licensing risk, fully portable, and retention becomes an instant `DROP TABLE`
   of an old partition instead of mass `DELETE`.
-- **Companion blob cold tier:** because in-Postgres compression is unavailable, an **Azure Blob
-  Storage** account provides the cheap, compressed long tail — a raw-JSON landing zone for replay/DR
-  plus a columnar **Parquet** archive that can capture *all* realms regardless of the Postgres hot
-  allow-list (§5.6, §6.8). Postgres stays the hot/queryable tier; blob is the cheap archive. A
-  self-managed VM with TSL TimescaleDB was considered and **rejected** (only ~50 GB available).
+- **Long-term storage tiering** (a cheap blob/Parquet cold archive to capture _all_ realms and recover
+  compression-like savings) is **deferred** — see
+  [`auction-pipeline-future-enhancements.md`](./auction-pipeline-future-enhancements.md). v1 is
+  Postgres-only.
 
 ### 2.4 Item-variant granularity → cardinality impact
 
-Preserving bonuses multiplies **per-realm gear** cardinality (a single item ID can appear as many
-ilvl/affix variants). Commodities are unaffected (no bonuses). Storage projections (§5.5) apply a
-gear-variant multiplier. The Postgres **hot-tier allow-list** therefore stays modest, while the **blob
-Parquet archive (§5.6) captures all realms cheaply** regardless; size Postgres storage when the hot
-allow-list grows.
+Real high-pop-realm data (connected realm 76: **54,081 listings / 13,908 distinct item IDs**) drove the
+v1 keying decision:
+
+| Snapshot key                              | Rows   | vs item-only | Singleton listings\* |
+| ----------------------------------------- | ------ | ------------ | -------------------- |
+| `item_id` only (old app)                  | 13,908 | 1.00×        | —                    |
+| **`item` + `bonus_lists` + pet** (chosen) | 24,055 | **1.73×**    | ~29%                 |
+| `item` + bonus + pet + all modifiers      | 33,740 | 2.43×        | ~49%                 |
+
+\* listings whose exact key appears **once** in the snapshot — non-recurring, can't form a candle.
+
+**Decision: key on `item_id` + `bonus_lists` + pet identity — _not_ raw `modifiers`.** Modifiers
+(types 6/28/39/40, etc.) are high-cardinality crafter/character metadata (**754–939 distinct values
+each**), so a full-modifier key balloons to 2.43× with **~49% of listings as non-recurring singletons**
+— storage bloat with no time-series value. `bonus_lists` (ilvl, quality stars, sockets) and pet species
+are the only buyer-facing distinctions, and the only ones **Wowhead tooltips can render** (§7.3). This
+gives the ~1.73× factor used in §5.5. Commodities are unaffected (no bonuses/modifiers → `item_id` is
+the key). The per-realm **allow-list** stays modest in v1; size Postgres storage before growing it. (A
+cheap blob/Parquet cold archive to capture _all_ realms is deferred — see
+[`auction-pipeline-future-enhancements.md`](./auction-pipeline-future-enhancements.md).)
 
 ---
 
@@ -118,16 +131,16 @@ A modernized `IBlizzardService` (port + clean up the old one) encapsulates all B
 
 ### 3.2 Endpoints used
 
-| Purpose | Method + Path | Namespace |
-|---|---|---|
-| Token | `POST oauth/token` | — |
-| Connected realm index | `GET /data/wow/connected-realm/index` | `dynamic-us` |
-| Connected realm detail | `GET /data/wow/connected-realm/{id}` | `dynamic-us` |
+| Purpose                | Method + Path                                 | Namespace    |
+| ---------------------- | --------------------------------------------- | ------------ | --- | --- | ------------- | ----------- |
+| Token                  | `POST oauth/token`                            | —            |
+| Connected realm index  | `GET /data/wow/connected-realm/index`         | `dynamic-us` |
+| Connected realm detail | `GET /data/wow/connected-realm/{id}`          | `dynamic-us` |
 | **Per-realm auctions** | `GET /data/wow/connected-realm/{id}/auctions` | `dynamic-us` |
-| **Commodities** | `GET /data/wow/auctions/commodities` | `dynamic-us` |
-| Item detail | `GET /data/wow/item/{itemId}` | `static-us` |
-| Item search (batch) | `GET /data/wow/search/item?id=A||B||C` (≤100 ids) | `static-us` |
-| WoW token price | `GET /data/wow/token/index` | `dynamic-us` |
+| **Commodities**        | `GET /data/wow/auctions/commodities`          | `dynamic-us` |
+| Item detail            | `GET /data/wow/item/{itemId}`                 | `static-us`  |
+| Item search (batch)    | `GET /data/wow/search/item?id=A               |              | B   |     | C` (≤100 ids) | `static-us` |
+| WoW token price        | `GET /data/wow/token/index`                   | `dynamic-us` |
 
 Base host: `https://us.api.blizzard.com`. Locale `en_US`.
 
@@ -136,7 +149,7 @@ Base host: `https://us.api.blizzard.com`. Locale `en_US`.
 Both auction endpoints return a `Last-Modified` header and honor **`If-Modified-Since`**. Blizzard
 refreshes AH data roughly **once per hour**, staggered per realm. The pull jobs **store the last
 `Last-Modified` per source** (commodities + each connected realm) and send `If-Modified-Since`; a
-**`304 Not Modified`** means *skip* — no parse, no insert. This avoids duplicate hourly rows and saves
+**`304 Not Modified`** means _skip_ — no parse, no insert. This avoids duplicate hourly rows and saves
 significant CPU/IO.
 
 ### 3.4 Streaming deserialization
@@ -153,9 +166,9 @@ materializing the whole document/object graph. This replaces the old full-string
   loop), so one bad realm doesn't fail the whole run.
 - All calls accept and propagate `CancellationToken`.
 
-### 3.6 Captured auction fields (variant-defining)
+### 3.6 Captured auction fields
 
-`BlizzardAuctionItem` must be extended to capture everything that distinguishes a variant:
+`BlizzardAuctionItem` must be extended to capture the variant-key fields (`bonus_lists` + pet identity):
 
 ```jsonc
 // per-realm auction entry
@@ -163,9 +176,9 @@ materializing the whole document/object graph. This replaces the old full-string
   "id": 123456789,
   "item": {
     "id": 168185,
-    "context": 13,
-    "bonus_lists": [4780, 6496, 1472],
-    "modifiers": [{ "type": 9, "value": 132 }],
+    "context": 13,                              // ignored — not part of the variant key
+    "bonus_lists": [4780, 6496, 1472],          // ← variant key + Wowhead tooltip payload
+    "modifiers": [{ "type": 9, "value": 132 }], // ignored — high-cardinality noise (§2.4)
     "pet_breed_id": null, "pet_level": null,
     "pet_quality_id": null, "pet_species_id": null
   },
@@ -175,9 +188,10 @@ materializing the whole document/object graph. This replaces the old full-string
 { "id": 555, "item": { "id": 168327 }, "unit_price": 6000, "quantity": 200, "time_left": "SHORT" }
 ```
 
-> Exact field presence (esp. pet fields, `modifiers` shape) **must be validated against a live API
-> sample** during implementation; the variant signature (§4.3) is built only from the fields actually
-> present.
+> The variant key uses **`bonus_lists` + pet identity only**; `modifiers` and `context` are
+> intentionally **not** part of the key (high-cardinality crafter/character metadata, not
+> Wowhead-renderable — see §2.4) and need not be persisted. Exact pet-field presence **must be
+> validated against a live API sample** during implementation.
 
 ---
 
@@ -195,53 +209,54 @@ Prices are **copper** stored as `bigint` (a few million gold ≈ tens of billion
 
 Ported/trimmed from the old `WoWItem`. EF entity; PK = Blizzard item id (`int`).
 
-| Column | Type | Notes |
-|---|---|---|
-| `Id` | int (PK) | Blizzard item id |
-| `Name` | varchar(255) | |
-| `Quality` | varchar(50) | common/rare/epic/… |
-| `ItemClass` | varchar(50) | used by always-process filters |
-| `ItemSubclass` | varchar(50) | |
-| `InventoryType` | varchar(50) | |
-| `Level`, `RequiredLevel` | int | base item level |
-| `IsEquippable`, `IsStackable` | bool | |
-| `IsCommodity` | bool | true if seen in commodities feed |
-| `SellPrice`, `PurchasePrice`, `PurchaseQuantity`, `MaxCount` | bigint/int | vendor data |
-| `MetadataSyncedAt` | timestamptz (nullable) | null ⇒ discovered but not yet backfilled |
+| Column                                                       | Type                   | Notes                                    |
+| ------------------------------------------------------------ | ---------------------- | ---------------------------------------- |
+| `Id`                                                         | int (PK)               | Blizzard item id                         |
+| `Name`                                                       | varchar(255)           |                                          |
+| `Quality`                                                    | varchar(50)            | common/rare/epic/…                       |
+| `ItemClass`                                                  | varchar(50)            | used by always-process filters           |
+| `ItemSubclass`                                               | varchar(50)            |                                          |
+| `InventoryType`                                              | varchar(50)            |                                          |
+| `Level`, `RequiredLevel`                                     | int                    | base item level                          |
+| `IsEquippable`, `IsStackable`                                | bool                   |                                          |
+| `IsCommodity`                                                | bool                   | true if seen in commodities feed         |
+| `SellPrice`, `PurchasePrice`, `PurchaseQuantity`, `MaxCount` | bigint/int             | vendor data                              |
+| `MetadataSyncedAt`                                           | timestamptz (nullable) | null ⇒ discovered but not yet backfilled |
 
 ### 4.2 `ItemVariant` (variant dimension)
 
-Normalizes heavy bonus/modifier arrays **out of** the fact rows. One row per distinct
+Normalizes the `bonus_lists` array (and pet identity) **out of** the fact rows. One row per distinct
 `(ItemId, VariantHash)`.
 
-| Column | Type | Notes |
-|---|---|---|
-| `Id` | bigint (PK, identity) | surrogate, referenced by snapshots optionally (see §4.4) |
-| `ItemId` | int (FK → Item) | |
-| `VariantHash` | bytea(8) / bigint | deterministic hash of the canonical signature |
-| `Context` | int (nullable) | |
-| `BonusLists` | int[] | Postgres array |
-| `Modifiers` | jsonb | array of `{type,value}` |
-| `PetBreedId`/`PetLevel`/`PetQualityId`/`PetSpeciesId` | int (nullable) | caged pets |
-| `IsBaseVariant` | bool | true when no bonuses/modifiers/pet (e.g., all commodities) |
-| `FirstSeenAt` | timestamptz | |
+| Column                                                | Type                  | Notes                                                    |
+| ----------------------------------------------------- | --------------------- | -------------------------------------------------------- |
+| `Id`                                                  | bigint (PK, identity) | surrogate, referenced by snapshots optionally (see §4.4) |
+| `ItemId`                                              | int (FK → Item)       |                                                          |
+| `VariantHash`                                         | bytea(8) / bigint     | deterministic hash of the canonical signature            |
+| `BonusLists`                                          | int[]                 | Postgres array; renderable via Wowhead `bonus=` (§7.3)   |
+| `PetBreedId`/`PetLevel`/`PetQualityId`/`PetSpeciesId` | int (nullable)        | caged pets                                               |
+| `IsBaseVariant`                                       | bool                  | true when no bonus_lists/pet (e.g., all commodities)     |
+| `FirstSeenAt`                                         | timestamptz           |                                                          |
 
 Unique index `(ItemId, VariantHash)`. For commodities, every auction maps to the item's single
-**base variant** (`VariantHash` = canonical empty signature).
+**base variant** (`VariantHash` = canonical empty signature). `modifiers` and `context` are
+deliberately **not** stored (§2.4).
 
 ### 4.3 Variant signature & hash (deterministic)
 
 The signature must be **stable and order-independent** so the same physical item always hashes the same:
 
 1. Sort `bonus_lists` ascending → `b1,b2,…`.
-2. Sort `modifiers` by `type` → `t1:v1;t2:v2;…`.
-3. Append pet fields if present → `pet=species:breed:quality:level`.
-4. Compose `"<itemId>|ctx=<context>|bl=<…>|mod=<…>|pet=<…>"`.
-5. `VariantHash = xxHash64(signature)` (8 bytes; collision-resistant enough at our cardinality and
-   small to carry on fact rows). Store the full components on `ItemVariant` for reconstruction.
+2. Append pet identity if present → `pet=species:breed:quality:level`.
+3. Compose `"<itemId>|bl=<…>|pet=<…>"`.
+4. `VariantHash = xxHash64(signature)` (8 bytes; collision-resistant enough at our cardinality and
+   small to carry on fact rows). Store `bonus_lists` + pet fields on `ItemVariant` for reconstruction
+   and tooltip rendering.
 
-Base variant (no bonuses/modifiers/pet) hashes a fixed canonical empty string so all commodities and
-plain items share their item's base variant.
+`modifiers` and `context` are deliberately **excluded** from the signature (§2.4): they are
+high-cardinality crafter/character noise, not buyer-facing, and not Wowhead-renderable. Base variant
+(no bonus_lists/pet) hashes a fixed canonical empty string so all commodities and plain items share
+their item's base variant.
 
 ### 4.4 `AuctionSnapshot` (raw hourly fact — partitioned)
 
@@ -249,19 +264,19 @@ One row per `(item variant, realm-or-region, hour)`. Carries the **`VariantHash`
 hot bulk-insert path does **not** require a synchronous FK lookup; `ItemVariant` is upserted separately
 (§6.3). `ConnectedRealmId = 0` is the **region-commodity sentinel**.
 
-| Column | Type | Notes |
-|---|---|---|
-| `SnapshotHour` | timestamptz | truncated to the hour (UTC); **partition key** |
-| `ItemId` | int | |
-| `VariantHash` | bytea(8) | base-variant value for commodities |
-| `ConnectedRealmId` | int | `0` = region commodities |
-| `Quantity` | bigint | total units available |
-| `NumAuctions` | int | listing count |
-| `MinUnitPrice` | bigint | cheapest unit price (copper) |
-| `MaxUnitPrice` | bigint | |
-| `AvgUnitPrice` | bigint | quantity-weighted mean |
-| `MarketPrice` | bigint | robust value = qty-weighted mean of cheapest 15% of supply |
-| `P25`,`P50`,`P75`,`P95` | bigint | quantity-weighted percentiles |
+| Column                  | Type        | Notes                                                      |
+| ----------------------- | ----------- | ---------------------------------------------------------- |
+| `SnapshotHour`          | timestamptz | truncated to the hour (UTC); **partition key**             |
+| `ItemId`                | int         |                                                            |
+| `VariantHash`           | bytea(8)    | base-variant value for commodities                         |
+| `ConnectedRealmId`      | int         | `0` = region commodities                                   |
+| `Quantity`              | bigint      | total units available                                      |
+| `NumAuctions`           | int         | listing count                                              |
+| `MinUnitPrice`          | bigint      | cheapest unit price (copper)                               |
+| `MaxUnitPrice`          | bigint      |                                                            |
+| `AvgUnitPrice`          | bigint      | quantity-weighted mean                                     |
+| `MarketPrice`           | bigint      | robust value = qty-weighted mean of cheapest 15% of supply |
+| `P25`,`P50`,`P75`,`P95` | bigint      | quantity-weighted percentiles                              |
 
 **Composite PK** `(SnapshotHour, ConnectedRealmId, ItemId, VariantHash)` — includes the partition key
 (Postgres requirement) and gives natural **idempotency** (re-running an hour upserts the same key).
@@ -275,18 +290,18 @@ fraction crosses each target (fixes the old `Enumerable.Repeat` memory blow-up).
 
 One row per `(item variant, realm-or-region, day)`, built from that day's up-to-24 snapshots.
 
-| Column | Type | Notes |
-|---|---|---|
-| `CandleDate` | date | UTC day; **partition key** |
-| `ItemId` | int | |
-| `VariantHash` | bytea(8) | |
-| `ConnectedRealmId` | int | `0` = region commodities |
-| `Open`,`High`,`Low`,`Close` | bigint | OHLC of `MarketPrice` across the day's snapshots |
-| `AvgMarketPrice` | bigint | mean of snapshot `MarketPrice` |
-| `MinUnitPrice`,`MaxUnitPrice` | bigint | absolute extremes observed during the day |
-| `AvgP50`,`AvgQuantity` | bigint | mean of hourly median / quantity |
-| `MinQuantity`,`MaxQuantity`,`EndQuantity` | bigint | supply envelope + last reading |
-| `SnapshotCount` | smallint | data completeness (≤24) |
+| Column                                    | Type     | Notes                                            |
+| ----------------------------------------- | -------- | ------------------------------------------------ |
+| `CandleDate`                              | date     | UTC day; **partition key**                       |
+| `ItemId`                                  | int      |                                                  |
+| `VariantHash`                             | bytea(8) |                                                  |
+| `ConnectedRealmId`                        | int      | `0` = region commodities                         |
+| `Open`,`High`,`Low`,`Close`               | bigint   | OHLC of `MarketPrice` across the day's snapshots |
+| `AvgMarketPrice`                          | bigint   | mean of snapshot `MarketPrice`                   |
+| `MinUnitPrice`,`MaxUnitPrice`             | bigint   | absolute extremes observed during the day        |
+| `AvgP50`,`AvgQuantity`                    | bigint   | mean of hourly median / quantity                 |
+| `MinQuantity`,`MaxQuantity`,`EndQuantity` | bigint   | supply envelope + last reading                   |
+| `SnapshotCount`                           | smallint | data completeness (≤24)                          |
 
 **Composite PK** `(CandleDate, ConnectedRealmId, ItemId, VariantHash)`.
 
@@ -312,7 +327,7 @@ commodities + allow-listed realms."
 
 ---
 
-## 5. Storage Tiers, Partitioning, Retention & Rollup
+## 5. Storage, Partitioning, Retention & Rollup
 
 ### 5.1 Native declarative partitioning
 
@@ -374,35 +389,16 @@ envelope + completeness). Idempotent via `INSERT … ON CONFLICT (…) DO UPDATE
 
 ### 5.5 Storage projections (~150 B/row raw, ~130 B/row candle)
 
-| Scope | Raw (30-day window) | Daily candles / year |
-|---|---|---|
-| Commodities only (~12k items) | ~1.5 GB | ~0.6 GB/yr |
-| + each allow-listed realm (gear, ~25k base items × ~2–4 variant factor) | ~+6–12 GB/realm | ~+2.5–5 GB/realm/yr |
-| All ~240 US realms | ~720 GB+ | ~290 GB+/yr |
+| Scope                                                                       | Raw (30-day window) | Daily candles / year |
+| --------------------------------------------------------------------------- | ------------------- | -------------------- |
+| Commodities only (~12k items)                                               | ~1.5 GB             | ~0.6 GB/yr           |
+| + each allow-listed realm (gear+pets, ~14k items × ~1.73 factor ≈ 24k rows) | ~+2.5–3 GB/realm    | ~+1–1.5 GB/realm/yr  |
+| All ~240 US realms                                                          | ~600 GB+            | ~270 GB+/yr          |
 
 **Guidance:** start commodities-heavy with a **small allow-list (a handful of realms)**; **bump
-Postgres storage before expanding** the allow-list. Variant granularity makes per-realm growth roughly
-2–4× the base-item estimate for gear-heavy realms.
-
-### 5.6 Storage tiers: hot Postgres + cold blob archive
-
-Because Postgres compression is unavailable (§2.3), storage is split into tiers:
-
-| Tier | Store | Contents | Retention |
-|---|---|---|---|
-| **Hot** | Postgres (Flexible Server) | raw hourly snapshots for the **allow-list** realms + commodities; daily candles | raw 30 d; candles indefinite |
-| **Cold — raw** | Blob landing zone | gzipped raw Blizzard JSON per pull, all archive realms | configurable (e.g., 30–90 d), lifecycle-deleted |
-| **Cold — archive** | Blob Parquet | compressed columnar hourly snapshots, **all archive realms** | indefinite, auto-tiered Cool→Cold→Archive |
-
-- The **archive set** (what goes to blob) can be **broader than the hot allow-list** (default: all US
-  realms), so Coinwarden captures *all item data* cheaply while Postgres stays lean — directly solving
-  the old app's "couldn't store all items" limitation.
-- **Parquet + Zstd** compresses this numeric series ~10–20× vs. Postgres heap+indexes, recovering most
-  of the benefit lost by not having TimescaleDB compression.
-- Blob is the **system of record for raw data**: if aggregation logic changes (MarketPrice formula,
-  finer variant handling), reprocess from the landing zone — no data lost.
-- Blob is **not** on the low-latency API path; the hot Postgres tier serves all read APIs (§7). Cold
-  analytics use DuckDB / Synapse serverless over Parquet (§12).
+Postgres storage before expanding** the allow-list. The `bonus_lists` + pet variant key makes per-realm
+growth roughly **1.73×** the base-item count (measured on a high-pop realm, §2.4) — far below the 2.43×
+a full-modifier key would cost.
 
 ---
 
@@ -422,15 +418,12 @@ settings, `DisableConcurrentExecution`, correlation-id logging, `CancellationTok
 
 ### 6.2 `PullRealmAuctionDataJob` — hourly
 
-1. Resolve realms: the **hot set** = union of subscription providers (§4.7); the **archive set**
-   (≥ hot set, default all US realms) governs what is written to blob (§6.8).
-2. For each realm in the archive set (queue with bounded re-tries, like the old app):
-   - Conditional GET realm auctions; `304` ⇒ skip. Stream the gzipped raw JSON to the blob landing
-     zone (§6.8).
+1. Resolve target realms = union of subscription providers (§4.7).
+2. For each realm (queue with bounded re-tries, like the old app):
+   - Conditional GET realm auctions; `304` ⇒ skip.
    - Stream-parse; for each auction compute the **variant signature/hash** (§4.3); aggregate per
      `(item, variant)`; filter to the realm's item selector (all items, or class-filtered).
-   - If the realm is in the **hot set**, bulk-load snapshots into Postgres; always retain the hourly
-     aggregates for the Parquet archive. Collect **new items and new variants**.
+   - Bulk-load snapshots into Postgres (§6.7); collect **new items and new variants**.
 3. Enqueue `SyncItemMetadataJob` for new items; upsert new `ItemVariant` rows.
 
 ### 6.3 `SyncItemMetadataJob` — on demand / periodic sweep
@@ -473,35 +466,16 @@ Hourly writers can produce millions of rows. EF `AddRange`/`SaveChanges` is too 
 Change tracking is disabled on the bulk path; aggregation happens in-app from the stream, the DB does
 the merge. A small `IBulkAuctionWriter` abstraction wraps this.
 
-### 6.8 `ArchiveAuctionDataToBlobJob` — write-through + daily
+### 6.8 Cadence summary
 
-Writes to the **blob cold tier** (§5.6) via two paths:
-
-- **Raw landing zone (write-through, during pulls):** the gzipped raw Blizzard JSON for every fetched
-  source is streamed to `raw/{region}/{source}/{yyyy}/{MM}/{dd}/{HH}.json.gz` (`source` = `commodities`
-  or `realm-{id}`). Cheap insurance enabling **replay/reprocessing** if aggregation logic changes.
-- **Parquet archive (daily batch):** consolidates the day's aggregated hourly snapshots into compressed
-  **Parquet** partitioned by `region/date` with one file per realm-day (large files, low object count).
-  Covers the **archive set** (default: all US realms) — hot realms sourced from Postgres, archive-only
-  realms from the pull's retained hourly aggregates. This is how **"capture all item data"** is met
-  cheaply without bloating Postgres.
-
-Idempotent (re-writing a day overwrites its objects). Uses `Azure.Storage.Blobs` + `Parquet.Net`. Blob
-**lifecycle management** (§8) auto-tiers objects Hot→Cool→Cold→Archive by age and deletes the raw
-landing zone after a configurable window. A cold query path (DuckDB / Synapse serverless) is future
-work (§12).
-
-### 6.9 Cadence summary
-
-| Job | Default schedule |
-|---|---|
-| `PullCommodityAuctionDataJob` | hourly (e.g., `5 * * * *`) |
-| `PullRealmAuctionDataJob` | hourly (e.g., `10 * * * *`) |
-| `SyncItemMetadataJob` | every 15 min sweep + enqueued on discovery |
-| `SyncRealmTopologyJob` | daily |
-| `ArchiveAuctionDataToBlobJob` | raw write-through during pulls; Parquet daily after rollup |
-| `RollupDailyCandlesJob` | daily, shortly after 00:00 UTC |
-| `PartitionMaintenanceJob` | daily, before rollup/after purge window |
+| Job                           | Default schedule                           |
+| ----------------------------- | ------------------------------------------ |
+| `PullCommodityAuctionDataJob` | hourly (e.g., `5 * * * *`)                 |
+| `PullRealmAuctionDataJob`     | hourly (e.g., `10 * * * *`)                |
+| `SyncItemMetadataJob`         | every 15 min sweep + enqueued on discovery |
+| `SyncRealmTopologyJob`        | daily                                      |
+| `RollupDailyCandlesJob`       | daily, shortly after 00:00 UTC             |
+| `PartitionMaintenanceJob`     | daily, before rollup/after purge window    |
 
 ---
 
@@ -518,21 +492,21 @@ All endpoints follow template conventions: versioned routes, `ServiceControllerB
 
 ### 7.1 Items & realms
 
-| Endpoint | Description |
-|---|---|
-| `GET /items` | search/list items — filters `nameContains`, `itemClass`, `quality`, `isCommodity`; cursor-paginated |
-| `GET /items/{itemId}` | item detail |
-| `GET /items/{itemId}/variants` | known variants for an item |
-| `GET /connected-realms` | list connected realms (+ realms) |
-| `GET /realms` | list/search realms |
+| Endpoint                       | Description                                                                                         |
+| ------------------------------ | --------------------------------------------------------------------------------------------------- |
+| `GET /items`                   | search/list items — filters `nameContains`, `itemClass`, `quality`, `isCommodity`; cursor-paginated |
+| `GET /items/{itemId}`          | item detail                                                                                         |
+| `GET /items/{itemId}/variants` | known variants for an item                                                                          |
+| `GET /connected-realms`        | list connected realms (+ realms)                                                                    |
+| `GET /realms`                  | list/search realms                                                                                  |
 
 ### 7.2 Auction data (incl. aggregates)
 
-| Endpoint | Description |
-|---|---|
+| Endpoint                  | Description                                                                                                                                                                  |
+| ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `GET /auctions/snapshots` | **raw hourly** series. Required: `itemId`, `connectedRealmId` (`0`=commodities), `startDate`. Optional: `variantHash` (omit ⇒ aggregate across variants), `endDate`, cursor. |
-| `GET /auctions/candles` | **daily candlesticks** (OHLC). Same filters, wider default window; primary charting source for ranges > 30 days. |
-| `GET /auctions/latest` | latest snapshot for an item(+variant) on a realm, or across realms (current price + cross-realm comparison). |
+| `GET /auctions/candles`   | **daily candlesticks** (OHLC). Same filters, wider default window; primary charting source for ranges > 30 days.                                                             |
+| `GET /auctions/latest`    | latest snapshot for an item(+variant) on a realm, or across realms (current price + cross-realm comparison).                                                                 |
 
 Query parameters use a `CursorPaginationQueryParameters`-derived record (port
 `AuctionTimeSeriesQueryParameters`) with validation. The repository translates `connectedRealmId` to
@@ -545,6 +519,12 @@ include the commodity sentinel when appropriate. DTOs: `AuctionSnapshotDto`, `Au
 it returns a per-timestamp **aggregate across all variants** (e.g., min over variants, summed quantity)
 so callers that don't care about variants get a clean series; supplying it pins to one physical item.
 
+Each variant carries its `bonus_lists` + pet species, which the UI renders as a **Wowhead tooltip**
+(`data-wowhead="item=<id>&bonus=<b1,b2,…>"`, or a `pet=<species>` tooltip for caged pets) — the exact
+fields the variant key is built from, so every distinct series maps to a distinct, renderable tooltip.
+Wowhead tooltips have **no** equivalent for Blizzard's auction `modifiers`, which is a further reason
+they are excluded from the key (§2.4).
+
 ---
 
 ## 8. Configuration & Settings
@@ -556,34 +536,26 @@ so callers that don't care about variants get a clean series; supplying it pins 
   "Blizzard": {
     "ApiBaseUrl": "https://us.api.blizzard.com",
     "OAuthUrl": "https://oauth.battle.net/token",
-    "Region": "us", "Namespace": "dynamic-us", "StaticNamespace": "static-us", "Locale": "en_US",
-    "ClientId": "<key-vault>", "ClientSecret": "<key-vault>"
+    "Region": "us",
+    "Namespace": "dynamic-us",
+    "StaticNamespace": "static-us",
+    "Locale": "en_US",
+    "ClientId": "<key-vault>",
+    "ClientSecret": "<key-vault>"
   },
   "AuctionPipeline": {
     "RawSnapshotRetentionDays": 30,
-    "AllowListConnectedRealmIds": [],          // Postgres HOT-tier realms
-    "AlwaysProcessItemClasses": { },           // { "Consumable": ["Potion","Flask"], ... }
-    "MaxRealmRetryAttempts": 5,
-    "Archive": {
-      "Enabled": true,
-      "ArchiveAllRealms": true,                // false ⇒ archive only the hot allow-list
-      "ArchiveConnectedRealmIds": [],          // explicit set used when ArchiveAllRealms = false
-      "RawLandingRetentionDays": 30            // lifecycle delete window for raw JSON
-    }
-  },
-  "Storage": {
-    "BlobAccountUrl": "https://<account>.blob.core.windows.net",  // Managed Identity (DefaultAzureCredential)
-    "RawContainer": "auction-raw",
-    "ArchiveContainer": "auction-archive"
+    "AllowListConnectedRealmIds": [], // Postgres realms to capture
+    "AlwaysProcessItemClasses": {}, // { "Consumable": ["Potion","Flask"], ... }
+    "MaxRealmRetryAttempts": 5
   },
   "BackgroundJobs": {
     "PullCommodityAuctionData": { "Enabled": true, "Schedule": "5 * * * *" },
-    "PullRealmAuctionData":     { "Enabled": true, "Schedule": "10 * * * *" },
-    "SyncItemMetadata":         { "Enabled": true, "Schedule": "*/15 * * * *" },
-    "SyncRealmTopology":        { "Enabled": true, "Schedule": "30 3 * * *" },
-    "ArchiveAuctionDataToBlob": { "Enabled": true, "Schedule": "40 0 * * *" },
-    "RollupDailyCandles":       { "Enabled": true, "Schedule": "20 0 * * *" },
-    "PartitionMaintenance":     { "Enabled": true, "Schedule": "0 0 * * *" }
+    "PullRealmAuctionData": { "Enabled": true, "Schedule": "10 * * * *" },
+    "SyncItemMetadata": { "Enabled": true, "Schedule": "*/15 * * * *" },
+    "SyncRealmTopology": { "Enabled": true, "Schedule": "30 3 * * *" },
+    "RollupDailyCandles": { "Enabled": true, "Schedule": "20 0 * * *" },
+    "PartitionMaintenance": { "Enabled": true, "Schedule": "0 0 * * *" }
   }
 }
 ```
@@ -605,10 +577,6 @@ Each job's `Enabled` flag gates `RecurringJob.AddOrUpdate` vs `RemoveIfExists` (
   `get; init;`, repositories extend `Repository<…>`/`IRepository<…>`, all async methods take/pass
   `CancellationToken`.
 - **EF/Npgsql**: `AddDbContextPool`; bulk path uses a raw `NpgsqlConnection`.
-- **Blob storage**: add a **Storage Account** Bicep module (`CI/Azure/modules/storage.bicep`) with two
-  containers + a **lifecycle policy** (Hot→Cool→Cold→Archive; delete raw after N days). Access via
-  `Azure.Storage.Blobs` with **Managed Identity** (`DefaultAzureCredential`) — no keys in config;
-  grant the App Service the **Storage Blob Data Contributor** role. Parquet via `Parquet.Net`.
 - **UI** (future, out of scope): **shadcn** components consuming `/auctions/candles` + `/snapshots`.
 
 ---
@@ -621,62 +589,43 @@ Each job's `Enabled` flag gates `RecurringJob.AddOrUpdate` vs `RemoveIfExists` (
 - **Set-based rollup** runs entirely in Postgres.
 - **Rate budget:** 1 commodities + N realm + occasional 100-id item batches per hour ≪ 36k/hr.
 - **Storage sizing:** start small (commodities + a few realms ≈ well under the 32 GB default); raise
-  `storageSizeGB` in `postgres.bicep` before growing the hot allow-list (see §5.5). Offload the long
-  tail to blob (§5.6) instead of over-provisioning Postgres. Expected spend in **§11**.
+  `storageSizeGB` in `postgres.bicep` before growing the allow-list (see §5.5). Expected spend in **§11**.
 - **Connection pooling** via `AddDbContextPool`; bulk writer uses its own connection.
-- **Blob ops:** write few large files (one Parquet per realm-day) to keep transaction costs negligible;
-  rely on lifecycle tiering; keep all processing **in-region** (free transfer) to avoid internet egress.
 
 ---
 
 ## 11. Cost & Pricing Estimates
 
-> Approximate **US region, LRS, pay-as-you-go, early-2026 list prices** — Azure prices drift and vary
+> Approximate **US region, pay-as-you-go, early-2026 list prices** — Azure prices drift and vary
 > by region/redundancy; validate with the Azure Pricing Calculator. Excludes shared template costs
 > (App Service, Key Vault, App Insights) and any free credits.
 
-### 11.1 Postgres (Flexible Server) — the dominant cost
+### 11.1 Postgres (Flexible Server)
 
-| Component | Rate | Notes |
-|---|---|---|
-| Compute B1ms (1 vCore / 2 GiB) | **~$12–15/mo** | template default; fine for commodities + a few realms |
-| Compute B2ms (2 vCore / 4 GiB) | **~$25–30/mo** | headroom for hourly bulk-insert + rollup |
-| Storage (provisioned) | **~$0.10–0.12/GB/mo** | grow in steps; backups included ≤100% of storage |
+| Component                      | Rate                  | Notes                                                 |
+| ------------------------------ | --------------------- | ----------------------------------------------------- |
+| Compute B1ms (1 vCore / 2 GiB) | **~$12–15/mo**        | template default; fine for commodities + a few realms |
+| Compute B2ms (2 vCore / 4 GiB) | **~$25–30/mo**        | headroom for hourly bulk-insert + rollup              |
+| Storage (provisioned)          | **~$0.10–0.12/GB/mo** | grow in steps; backups included ≤100% of storage      |
 
-Hot-tier storage = raw 30-day window + indefinite daily candles + Hangfire + index/bloat headroom:
+Postgres storage = raw 30-day window + indefinite daily candles + Hangfire + index/bloat headroom:
 
-| Hot scope | Provisioned | Storage $/mo | Compute | **≈ Total/mo** |
-|---|---|---|---|---|
-| Commodities only | 32 GB | ~$3–4 | B1ms | **~$16–18** |
-| + ~5 allow-list realms | 64–128 GB | ~$7–15 | B1ms–B2ms | **~$20–45** |
-| + ~20 allow-list realms | 256 GB | ~$26–31 | B2ms | **~$55–61** |
+| Scope                   | Provisioned | Storage $/mo | Compute   | **≈ Total/mo** |
+| ----------------------- | ----------- | ------------ | --------- | -------------- |
+| Commodities only        | 32 GB       | ~$3–4        | B1ms      | **~$16–18**    |
+| + ~5 allow-list realms  | 64–128 GB   | ~$7–15       | B1ms–B2ms | **~$20–45**    |
+| + ~20 allow-list realms | 256 GB      | ~$26–31      | B2ms      | **~$55–61**    |
 
 Daily candles accrue forever (~0.6 GB/yr commodities + ~2.5–5 GB/realm/yr), so re-provision storage
 every so often.
 
-### 11.2 Blob storage — the cheap long tail
+### 11.2 Bottom line
 
-Storage (LRS): **Hot ~$0.018–0.023, Cool ~$0.010, Cold ~$0.0036, Archive ~$0.001–0.002 /GB/mo.**
-Writes ~$0.05 (Hot) / $0.10 (Cool) / $0.15 (Cold/Archive) per 10k; reads cheap except Archive
-(rehydration). **In-region transfer to the API is free**; only internet egress (~$0.09/GB) costs.
-Object counts stay low (a few large files, not millions of tiny ones).
-
-| Archive scope | Steady-state stored | Tier | Storage $/mo | Writes $/mo |
-|---|---|---|---|---|
-| Commodities + ~5 realms | ~20–40 GB | Cool | **<$1** | ~$0.10 |
-| Raw landing, **all 240 realms**, 30-day lifecycle | ~150–300 GB | Hot→Cool | **~$2–4** | ~$1–2 |
-| Parquet archive, **all 240 realms**, kept ~1 yr | ~1–2 TB (accruing) | Cold | **~$4–9** | ~$1–2 |
-| …auto-tiered to Archive after 90 d | ~1–2 TB | Archive | **~$2–5** | ~$1–2 |
-
-### 11.3 Bottom line
-
-- **Realistic starter** (B1ms, commodities + a few hot realms, blob archiving the same):
-  **~$17–25/mo all-in** for DB + storage.
-- **"Capture everything"** (same hot tier, blob archiving **all 240 realms** raw + Parquet, long-term):
-  adds only **~$5–15/mo** — blob makes full-fidelity capture affordable.
-- **Compute dominates**; storage choices move the total by single-digit dollars until the hot
-  allow-list grows large. Levers: keep the hot allow-list small, shrink the Postgres raw window to
-  offload sooner, and lean on blob lifecycle tiering.
+- **Realistic starter** (B1ms, commodities + a few realms): **~$16–22/mo all-in** for DB + storage.
+- **Compute dominates**; storage moves the total by single-digit dollars until the allow-list grows
+  large. Levers: keep the allow-list small and raise `storageSizeGB` in steps. Capturing _all_ realms
+  cheaply via a blob/Parquet cold tier is deferred — see
+  [`auction-pipeline-future-enhancements.md`](./auction-pipeline-future-enhancements.md).
 
 ---
 
@@ -687,11 +636,9 @@ Object counts stay low (a few large files, not millions of tiny ones).
 - **Watch-list/alert subscription provider:** interface defined here; wiring lands with those features.
 - **Multi-region:** model carries `Region`; enabling EU/KR/TW means region-scoped commodities + realm
   ids and larger storage.
-- **Cold query path:** query the Parquet archive (§6.8) in place with **DuckDB** (embedded, free) or
-  **Synapse serverless** for rare deep-history/backfill — not on the low-latency API path.
-- **Compression alternatives:** the blob Parquet archive is the chosen substitute for in-Postgres
-  compression (a self-managed VM with TSL TimescaleDB was rejected — only ~50 GB available). If hot-tier
-  pressure grows: Timescale Cloud, or coarser **weekly/monthly rollups** beyond daily.
+- **Cold storage tiering:** a cheap Azure Blob raw-JSON landing zone + Parquet archive to capture _all_
+  realms, recover compression-like savings, and enable replay/reprocessing — fully designed in
+  [`auction-pipeline-future-enhancements.md`](./auction-pipeline-future-enhancements.md).
 - **`pg_cron`** could run partition maintenance/rollup in-DB instead of Hangfire (deferred; Hangfire
   keeps it in one place).
 - **MarketPrice definition** (cheapest-15%-weighted) should be validated against TSM-style expectations
@@ -704,12 +651,9 @@ Object counts stay low (a few large files, not millions of tiny ones).
 1. EF migration creates dimension tables (`Item`, `ItemVariant`, `ConnectedRealm`, `Realm`) + Hangfire
    schema.
 2. Raw-SQL migration creates the **partitioned parent** fact tables + indexes (EF can't model these).
-3. First deploy runs `SyncRealmTopologyJob` to seed realms; operator sets `AllowListConnectedRealmIds`
-   (hot tier) and the `Archive` set.
-4. Provision the **Storage Account** + containers + lifecycle policy (Bicep); grant the App Service
-   **Storage Blob Data Contributor**.
-5. `PartitionMaintenanceJob` bootstraps the initial day/month partitions before the first pull.
-6. Pull jobs populate snapshots + blob; rollup/archive/purge engage on their daily cadence.
+3. First deploy runs `SyncRealmTopologyJob` to seed realms; operator sets `AllowListConnectedRealmIds`.
+4. `PartitionMaintenanceJob` bootstraps the initial day/month partitions before the first pull.
+5. Pull jobs populate snapshots; rollup/purge engage on their daily cadence.
 
 ---
 
