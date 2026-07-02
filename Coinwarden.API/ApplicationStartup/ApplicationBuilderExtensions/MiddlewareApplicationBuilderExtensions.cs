@@ -24,4 +24,13 @@ public static class MiddlewareApplicationBuilderExtensions
 
         return app;
     }
+
+    public static IApplicationBuilder UseSecurityHeadersMiddleware(this IApplicationBuilder app)
+    {
+        ArgumentNullException.ThrowIfNull(app);
+
+        app.UseMiddleware<SecurityHeadersMiddleware>();
+
+        return app;
+    }
 }

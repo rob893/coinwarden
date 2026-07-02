@@ -193,16 +193,23 @@ dotnet_naming_symbols.non_field_members.applicable_kinds = property, event, meth
 dotnet_naming_symbols.non_field_members.applicable_accessibilities = public, internal, private, protected, protected_internal, private_protected
 dotnet_naming_symbols.non_field_members.required_modifiers =
 
-dotnet_naming_symbols.all_fields.applicable_kinds = field
-dotnet_naming_symbols.all_fields.applicable_accessibilities = *
+dotnet_naming_symbols.non_private_fields.applicable_kinds = field
+dotnet_naming_symbols.non_private_fields.applicable_accessibilities = public, internal, protected, protected_internal
+
+dotnet_naming_symbols.private_fields.applicable_kinds = field
+dotnet_naming_symbols.private_fields.applicable_accessibilities = private, private_protected
 
 dotnet_naming_symbols.const_fields.applicable_kinds = field
 dotnet_naming_symbols.const_fields.applicable_accessibilities = public, internal, private, protected, protected_internal, private_protected
 dotnet_naming_symbols.const_fields.required_modifiers = const
 
-dotnet_naming_rule.fields_no_underscore_prefix.symbols = all_fields
-dotnet_naming_rule.fields_no_underscore_prefix.style = camel_case_no_prefix
-dotnet_naming_rule.fields_no_underscore_prefix.severity = error
+dotnet_naming_rule.non_private_fields_should_be_pascal_case.symbols = non_private_fields
+dotnet_naming_rule.non_private_fields_should_be_pascal_case.style = pascal_case
+dotnet_naming_rule.non_private_fields_should_be_pascal_case.severity = error
+
+dotnet_naming_rule.private_fields_no_underscore_prefix.symbols = private_fields
+dotnet_naming_rule.private_fields_no_underscore_prefix.style = camel_case_no_prefix
+dotnet_naming_rule.private_fields_no_underscore_prefix.severity = error
 
 dotnet_naming_rule.const_fields_should_be_pascal_case.symbols = const_fields
 dotnet_naming_rule.const_fields_should_be_pascal_case.style = pascal_case
@@ -227,6 +234,11 @@ dotnet_naming_style.camel_case_no_prefix.capitalization = camel_case
 
 # IDE0005: Using directive is unnecessary.
 dotnet_diagnostic.IDE0005.severity = error
+
+# IDE1006: Naming rule violation.
+# The severity on a dotnet_naming_rule is only honored by IDEs; the compiler ignores it during
+# build. Setting the code-rule severity here (with EnforceCodeStyleInBuild) enforces naming at build.
+dotnet_diagnostic.IDE1006.severity = error
 
 # Disables
 

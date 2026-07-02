@@ -4,6 +4,7 @@ using System.Text.Json;
 using System.Threading.Tasks;
 using Coinwarden.API.Constants;
 using Coinwarden.API.Core;
+using Coinwarden.API.Extensions;
 using Coinwarden.API.Models.Settings;
 using Coinwarden.API.Services.Auth;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
@@ -28,10 +29,13 @@ public static class AuthenticationServiceCollectionExtensions
         ArgumentNullException.ThrowIfNull(config);
 
         services.AddScoped<IJwtTokenService, JwtTokenService>();
+        services.AddScoped<IAuthTokenCookieService, AuthTokenCookieService>();
+        services.AddScoped<IOAuthFlowCookieService, OAuthFlowCookieService>();
         services.AddScoped<IGitHubOAuthService, GitHubOAuthService>();
         services.AddScoped<IGoogleOAuthService, GoogleOAuthService>();
         services.AddScoped<IExternalLoginService, ExternalLoginService>();
         services.AddScoped<ICurrentUserService, CurrentUserService>();
+        services.AddHttpContextAccessor();
 
         services.Configure<AuthenticationSettings>(config.GetSection(ConfigurationKeys.Authentication));
 
@@ -45,6 +49,13 @@ public static class AuthenticationServiceCollectionExtensions
         {
             throw new InvalidOperationException(
                 $"{ConfigurationKeys.Authentication}:{nameof(AuthenticationSettings.APISecret)} must be at least 64 bytes (512 bits) for HMAC-SHA512 token signing.");
+        }
+
+        if (config.GetEnvironment() != EnvironmentNames.Development &&
+            GoogleOAuthService.ResolveGoogleOAuthAudiences(authSettings).Count == 0)
+        {
+            throw new InvalidOperationException(
+                $"{ConfigurationKeys.Authentication}:{nameof(AuthenticationSettings.GoogleOAuthAudiences)} must contain at least one audience or {nameof(AuthenticationSettings.GoogleOAuthClientId)} must be configured outside Development.");
         }
 
         services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)

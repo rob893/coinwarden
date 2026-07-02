@@ -74,8 +74,28 @@ public sealed class GoogleOAuthService : IGoogleOAuthService
             idToken,
             new GoogleJsonWebSignature.ValidationSettings
             {
-                Audience = this.authSettings.GoogleOAuthAudiences
+                Audience = ResolveGoogleOAuthAudiences(this.authSettings)
             });
+    }
+
+    /// <summary>
+    /// Resolves the Google ID-token audiences to validate against, defaulting to the configured
+    /// client id when no explicit audiences are set so the <c>aud</c> claim is always pinned.
+    /// </summary>
+    /// <param name="authSettings">The authentication settings.</param>
+    /// <returns>The audiences to validate the Google ID token against.</returns>
+    internal static IReadOnlyList<string> ResolveGoogleOAuthAudiences(AuthenticationSettings authSettings)
+    {
+        ArgumentNullException.ThrowIfNull(authSettings);
+
+        if (authSettings.GoogleOAuthAudiences.Count > 0)
+        {
+            return authSettings.GoogleOAuthAudiences;
+        }
+
+        return string.IsNullOrWhiteSpace(authSettings.GoogleOAuthClientId)
+            ? []
+            : [authSettings.GoogleOAuthClientId];
     }
 
     private sealed record GoogleTokenResponse

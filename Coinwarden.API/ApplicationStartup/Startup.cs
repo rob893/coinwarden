@@ -64,6 +64,7 @@ public sealed class Startup
             .UseRouting()
             .UseHsts()
             .UseHttpsRedirection()
+            .UseSecurityHeadersMiddleware()
             .UseCorrelationIdMiddleware()
             .UseForwardedHeaders(BuildForwardedHeadersOptions(this.configuration))
             .UseMiddleware<PathBaseRewriterMiddleware>()

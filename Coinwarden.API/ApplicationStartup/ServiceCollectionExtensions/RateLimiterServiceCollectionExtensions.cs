@@ -56,7 +56,7 @@ public static class RateLimiterServiceCollectionExtensions
                         });
                 }
 
-                if (path.StartsWith("/api/v1/auth/", StringComparison.OrdinalIgnoreCase))
+                if (IsStrictAuthRateLimitedPath(path))
                 {
                     return RateLimitPartition.GetFixedWindowLimiter(
                         partitionKey: httpContext.GetPartitionKey(),
@@ -99,6 +99,14 @@ public static class RateLimiterServiceCollectionExtensions
         });
 
         return services;
+    }
+
+    internal static bool IsStrictAuthRateLimitedPath(string path)
+    {
+        return path.StartsWith("/api/v1/auth/", StringComparison.OrdinalIgnoreCase) ||
+            path.StartsWith("/api/v1/users/forgotpassword", StringComparison.OrdinalIgnoreCase) ||
+            path.StartsWith("/api/v1/users/resetpassword", StringComparison.OrdinalIgnoreCase) ||
+            path.StartsWith("/api/v1/users/emailconfirmations", StringComparison.OrdinalIgnoreCase);
     }
 
     internal static string GetPartitionKey(this HttpContext context)

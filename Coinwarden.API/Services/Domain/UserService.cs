@@ -407,8 +407,7 @@ public sealed class UserService : IUserService
         if (user == null || string.IsNullOrWhiteSpace(user.Email) || !user.EmailConfirmed)
         {
             this.logger.LogWarning(
-                "Failed to send password reset link for user with email {Email}: User not found or email not confirmed.",
-                request.Email);
+                "Failed to send password reset link: User not found or email not confirmed.");
             return Result<bool>.Success(true);
         }
 
@@ -438,8 +437,7 @@ public sealed class UserService : IUserService
         if (user == null || !user.EmailConfirmed)
         {
             this.logger.LogWarning(
-                "Failed to reset password for user with email {Email}: User not found or email not confirmed.",
-                request.Email);
+                "Failed to reset password: User not found or email not confirmed.");
             return Result<bool>.Success(true);
         }
 
@@ -448,9 +446,8 @@ public sealed class UserService : IUserService
         if (!result.Succeeded)
         {
             this.logger.LogWarning(
-                "Failed to reset password for user {UserId} ({Email}): {Errors}",
+                "Failed to reset password for user {UserId}: {Errors}",
                 user.Id,
-                user.Email,
                 string.Join(", ", result.Errors.Select(e => e.Description)));
         }
 
@@ -466,7 +463,7 @@ public sealed class UserService : IUserService
 
         if (user == null)
         {
-            this.logger.LogWarning("Failed to confirm email for {Email}: User not found", request.Email);
+            this.logger.LogWarning("Failed to confirm email: User not found");
             return Result<bool>.Failure(DomainErrorType.Validation, "Unable to confirm email");
         }
 
@@ -475,7 +472,7 @@ public sealed class UserService : IUserService
         if (!confirmResult.Succeeded)
         {
             var errors = string.Join(", ", confirmResult.Errors.Select(e => e.Description));
-            this.logger.LogWarning("Failed to confirm email for user {UserId} ({Email}): {Errors}", user.Id, user.Email, errors);
+            this.logger.LogWarning("Failed to confirm email for user {UserId}: {Errors}", user.Id, errors);
             return Result<bool>.Failure(DomainErrorType.Validation, errors);
         }
 
